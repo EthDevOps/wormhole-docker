@@ -1,0 +1,116 @@
+name: Docker
+
+# Builds the image straight from upstream lucamartinetti/wormhole-page.
+# Upstream has no releases or tags, so this tracks the main branch head:
+# every new upstream commit becomes an image tagged <short-sha> (+ latest)
+# and a matching release on this repo.
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Upstream branch or SHA to build (default: main HEAD)'
+        required: false
+      no_latest:
+        type: boolean
+        description: 'Rebuild: push only <short-sha>, skip release check and creation'
+        required: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  UPSTREAM: lucamartinetti/wormhole-page
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve upstream commit
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_NO_LATEST: ${{ inputs.no_latest }}
+        run: |
+          REF="${INPUT_REF:-main}"
+          SHA=$(git ls-remote --refs "https://github.com/$UPSTREAM.git" "refs/heads/$REF" | cut -f1)
+          # A full 40-char input is a commit SHA, not a branch name
+          if [ -z "$SHA" ] && [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+            SHA="$REF"
+          fi
+          if [ -z "$SHA" ]; then
+            echo "No such upstream branch or SHA: $REF" >&2; exit 1
+          fi
+          SHORT=${SHA::7}
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          if [ "$INPUT_NO_LATEST" = true ]; then
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          elif gh release view "$SHORT" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$SHORT already released, nothing to do"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout upstream ${{ steps.resolve.outputs.short }}
+        if: steps.resolve.outputs.new
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ steps.resolve.outputs.sha }}
+
+      - name: Set up Docker Buildx
+        if: steps.resolve.outputs.new
+        uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        if: steps.resolve.outputs.new
+        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d # v3.0.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        if: steps.resolve.outputs.new
+        id: meta
+        uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ steps.resolve.outputs.short }},enable=${{ inputs.no_latest != true }}
+            type=raw,value=${{ steps.resolve.outputs.short }}-${{ github.run_number }},enable=${{ inputs.no_latest == true }}
+            type=raw,value=latest,enable=${{ inputs.ref == '' && inputs.no_latest != true }}
+
+      - name: Build and push Docker image
+        if: steps.resolve.outputs.new
+        uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09 # v5.0.0
+        with:
+          context: .
+          file: Containerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create release
+        if: steps.resolve.outputs.new && inputs.no_latest != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          SHORT: ${{ steps.resolve.outputs.short }}
+        run: |
+          gh release create "$SHORT" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$SHORT" \
+            --notes "Upstream commit: https://github.com/$UPSTREAM/commit/$SHA
+
+          Image: \`$REGISTRY/${IMAGE_NAME,,}:$SHORT\` (also \`latest\`)"
